@@ -194,10 +194,23 @@ class TranscriberApp:
             )
             self._queue.put(("transcribe_total", info.duration or 0.0))
 
+            prev_end = None
+            sentences_in_paragraph = 0
             for segment in segments:
                 text = segment.text.strip()
                 if text:
-                    self._queue.put(("segment_text", text))
+                    # Un párrafo nuevo empieza si hubo una pausa notable (cambio de idea)
+                    # o si ya se acumularon varias oraciones seguidas, para que el texto
+                    # respire visualmente aunque el audio no tenga silencios largos.
+                    pause = (segment.start - prev_end) if prev_end is not None else None
+                    new_paragraph = prev_end is not None and (
+                        pause > 0.8 or sentences_in_paragraph >= 3
+                    )
+                    if new_paragraph or prev_end is None:
+                        sentences_in_paragraph = 0
+                    self._queue.put(("segment_text", text, new_paragraph))
+                    sentences_in_paragraph += 1
+                    prev_end = segment.end
                 self._queue.put(("transcribe_progress", segment.end))
 
             detected = f" (idioma detectado: {info.language})" if language is None else ""
@@ -238,9 +251,10 @@ class TranscriberApp:
                             text=f"Transcribiendo... {pct:.0f}% ({item[1]:.0f}s / {self._transcribe_duration:.0f}s)"
                         )
                 elif kind == "segment_text":
+                    text, new_paragraph = item[1], item[2]
                     if self.text_area.index("end-1c") != "1.0":
-                        self.text_area.insert(tk.END, " ")
-                    self.text_area.insert(tk.END, item[1])
+                        self.text_area.insert(tk.END, "\n\n" if new_paragraph else "\n")
+                    self.text_area.insert(tk.END, text)
                     self.text_area.see(tk.END)
                 elif kind == "done":
                     detected = item[1]
