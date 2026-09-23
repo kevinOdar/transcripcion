@@ -1,11 +1,20 @@
 import io
+import json
 import os
 import queue
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import sv_ttk
+
+SUMMARY_MODEL = "claude-haiku-4-5"
+SUMMARY_SYSTEM_PROMPT = (
+    "Resumís transcripciones de audio en español. Devolvé primero un resumen breve "
+    "de 2-3 frases y luego una lista de los puntos más importantes, en formato claro y directo."
+)
+ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
 
 MODEL_SIZES = ["small", "medium", "large-v3", "large-v3-turbo"]
 LANGUAGES = {
@@ -50,6 +59,32 @@ PALETTES = {
         "danger": "#ff6b6b",
     },
 }
+
+
+def _config_path():
+    # Se guarda fuera de la carpeta del repo (en %APPDATA%) para no arriesgar
+    # que la API key termine commiteada por accidente.
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    config_dir = os.path.join(base, "TranscriptorAudio")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, "config.json")
+
+
+def _load_saved_api_key():
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as f:
+            return json.load(f).get("anthropic_api_key") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_api_key(key):
+    try:
+        with open(_config_path(), "w", encoding="utf-8") as f:
+            json.dump({"anthropic_api_key": key}, f)
+    except OSError:
+        pass
+
 
 # faster-whisper descarga los modelos vía huggingface_hub. Al bajarlo por primera
 # vez, snapshot_download reporta el avance en bytes a través de una barra tqdm
@@ -186,12 +221,14 @@ class TranscriberApp:
         self._model_cache = {}  # (size) -> WhisperModel
         self._queue = queue.Queue()
         self._worker_running = False
+        self._summarizing = False
         self._cancel_event = threading.Event()
         self._transcribe_duration = 0.0
 
         sv_ttk.set_theme("light")
         self._build_ui()
         self._refresh_theme_colors()
+        self._refresh_text_actions_state()
 
     def _toggle_theme(self):
         sv_ttk.set_theme("dark" if self.dark_mode.get() else "light")
@@ -279,10 +316,27 @@ class TranscriberApp:
         # en curso (ver _set_busy), para no dejar una línea vacía en reposo.
         self.progress = ttk.Progressbar(progress_card, mode="determinate", maximum=100)
 
+        # Esta fila se empaqueta ANTES que el área de texto (que expande) y con
+        # side="bottom": así reserva su espacio primero y nunca queda aplastada
+        # a 0px cuando el contenido no entra completo en la ventana.
+        bottom_frame = ttk.Frame(container)
+        bottom_frame.pack(side="bottom", fill="x", pady=(12, 0))
+        self.save_btn = ttk.Button(bottom_frame, text="Guardar como .txt", command=self._save_txt)
+        self.save_btn.pack(side="left")
+        self.copy_btn = ttk.Button(bottom_frame, text="Copiar al portapapeles", command=self._copy_clipboard)
+        self.copy_btn.pack(side="left", padx=6)
+        self.clear_btn = ttk.Button(bottom_frame, text="Limpiar", command=self._clear_text)
+        self.clear_btn.pack(side="left")
+        self.summarize_btn = ttk.Button(
+            bottom_frame, text="Resumir con IA", style="Accent.TButton", command=self._start_summary
+        )
+        self.summarize_btn.pack(side="right")
+        self._text_action_buttons = (self.save_btn, self.copy_btn, self.clear_btn, self.summarize_btn)
+
         # Frame con 1px de "borde" (su propio color de fondo asoma alrededor del
         # texto) ya que tk.Text no tiene esquinas redondeadas ni borde temático.
         self.text_frame = tk.Frame(container, bd=0)
-        self.text_frame.pack(fill="both", expand=True, pady=(0, 12))
+        self.text_frame.pack(side="top", fill="both", expand=True)
         self.text_area = scrolledtext.ScrolledText(
             self.text_frame,
             wrap="word",
@@ -293,12 +347,6 @@ class TranscriberApp:
             pady=12,
         )
         self.text_area.pack(fill="both", expand=True, padx=1, pady=1)
-
-        bottom_frame = ttk.Frame(container)
-        bottom_frame.pack(fill="x")
-        ttk.Button(bottom_frame, text="Guardar como .txt", command=self._save_txt).pack(side="left")
-        ttk.Button(bottom_frame, text="Copiar al portapapeles", command=self._copy_clipboard).pack(side="left", padx=6)
-        ttk.Button(bottom_frame, text="Limpiar", command=self._clear_text).pack(side="left")
 
     def _browse_file(self):
         path = filedialog.askopenfilename(title="Selecciona un archivo de audio", filetypes=AUDIO_FILETYPES)
@@ -314,12 +362,15 @@ class TranscriberApp:
         self.lang_combo.set_enabled(not busy)
         self.cancel_btn.config(state="normal" if busy else "disabled")
         if busy:
+            for btn in self._text_action_buttons:
+                btn.config(state="disabled")
             self._transcribe_duration = 0.0
             self.progress.pack(side="right", fill="x", expand=True, padx=(12, 0))
             self.progress.config(mode="indeterminate")
             self.progress.start(12)
             self.status_label.config(style="StatusBusy.TLabel")
         else:
+            self._refresh_text_actions_state()
             self.progress.stop()
             self.progress.config(mode="determinate", maximum=100)
             self.progress["value"] = 0
@@ -327,6 +378,12 @@ class TranscriberApp:
             self.status_label.config(style="StatusNeutral.TLabel")
         if status:
             self.status_label.config(text=status)
+
+    def _refresh_text_actions_state(self):
+        has_text = bool(self.text_area.get("1.0", "end-1c").strip())
+        state = "normal" if has_text else "disabled"
+        for btn in self._text_action_buttons:
+            btn.config(state=state)
 
     def _cancel_transcription(self):
         if not self._worker_running:
@@ -347,7 +404,7 @@ class TranscriberApp:
         if not model_size:
             messagebox.showwarning("Falta modelo", "Selecciona un modelo antes de transcribir.")
             return
-        if self._worker_running:
+        if self._worker_running or self._summarizing:
             return
 
         self.text_area.delete("1.0", tk.END)
@@ -361,6 +418,138 @@ class TranscriberApp:
         )
         thread.start()
         self.root.after(100, self._poll_queue)
+
+    def _start_summary(self):
+        text = self.text_area.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showinfo("Nada que resumir", "No hay texto para resumir todavía.")
+            return
+        if self._worker_running or self._summarizing:
+            return
+
+        api_key = self._get_api_key()
+        if not api_key:
+            return
+
+        self._summarizing = True
+        self.summarize_btn.config(state="disabled")
+        self.status_label.config(text="Generando resumen con IA...", style="StatusBusy.TLabel")
+
+        thread = threading.Thread(target=self._summarize_worker, args=(text, api_key), daemon=True)
+        thread.start()
+        self.root.after(100, self._poll_queue)
+
+    def _get_api_key(self):
+        key = os.environ.get("ANTHROPIC_API_KEY") or _load_saved_api_key()
+        if key:
+            return key
+        key = self._prompt_for_api_key()
+        if not key:
+            return None
+        _save_api_key(key)
+        return key
+
+    def _prompt_for_api_key(self):
+        # No existe un "iniciar sesión con Anthropic" público para apps de
+        # terceros (eso es exclusivo del CLI oficial de Anthropic). Lo más
+        # simple es un botón que abre directo la página para generar la key.
+        palette = self._current_palette()
+        result = {"key": None}
+
+        win = tk.Toplevel(self.root)
+        win.title("API key de Anthropic")
+        win.configure(bg=palette["bg"])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(
+            body, wraplength=360, justify="left",
+            text="Para resumir con IA hace falta una API key de Anthropic.\n"
+                 "Se guarda localmente en tu carpeta de usuario, no en el proyecto.",
+        ).pack(anchor="w")
+
+        ttk.Button(
+            body, text="Obtener API key en console.anthropic.com",
+            command=lambda: webbrowser.open(ANTHROPIC_KEYS_URL),
+        ).pack(fill="x", pady=(12, 12))
+
+        entry_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=entry_var, show="•", width=44)
+        entry.pack(fill="x")
+        entry.focus_set()
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(16, 0))
+
+        def confirm(_event=None):
+            result["key"] = entry_var.get().strip() or None
+            win.destroy()
+
+        def cancel(_event=None):
+            win.destroy()
+
+        ttk.Button(btn_row, text="Cancelar", command=cancel).pack(side="left")
+        ttk.Button(btn_row, text="Guardar", style="Accent.TButton", command=confirm).pack(side="right")
+
+        entry.bind("<Return>", confirm)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{x}+{y}")
+
+        self.root.wait_window(win)
+        return result["key"]
+
+    def _summarize_worker(self, text, api_key):
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=SUMMARY_MODEL,
+                max_tokens=1024,
+                system=SUMMARY_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": text}],
+            )
+            summary = "".join(block.text for block in response.content if block.type == "text")
+            self._queue.put(("summary_done", summary))
+        except Exception as exc:  # noqa: BLE001
+            self._queue.put(("summary_error", str(exc)))
+
+    def _show_summary_window(self, summary):
+        palette = self._current_palette()
+        win = tk.Toplevel(self.root)
+        win.title("Resumen")
+        win.geometry("560x420")
+        win.configure(bg=palette["bg"])
+
+        text_wrap = tk.Frame(win, bg=palette["border"])
+        text_wrap.pack(fill="both", expand=True, padx=16, pady=16)
+        text_widget = tk.Text(
+            text_wrap, wrap="word", font=(FONT_FAMILY, 11),
+            bg=palette["text_bg"], fg=palette["text_fg"],
+            insertbackground=palette["text_fg"], relief="flat", bd=0, padx=14, pady=12,
+        )
+        text_widget.pack(fill="both", expand=True, padx=1, pady=1)
+        text_widget.insert("1.0", summary)
+        text_widget.config(state="disabled")
+
+        btn_frame = ttk.Frame(win, padding=(16, 0, 16, 16))
+        btn_frame.pack(fill="x")
+
+        def copy_summary():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(summary)
+
+        ttk.Button(btn_frame, text="Copiar", command=copy_summary).pack(side="left")
+        ttk.Button(btn_frame, text="Cerrar", command=win.destroy).pack(side="right")
 
     def _get_model(self, model_size: str):
         model = self._model_cache.get(model_size)
@@ -471,10 +660,20 @@ class TranscriberApp:
                 elif kind == "cancelled":
                     self._set_busy(False, "Cancelado.")
                     return
+                elif kind == "summary_done":
+                    self._summarizing = False
+                    self.summarize_btn.config(state="normal")
+                    self.status_label.config(text="✓ Resumen generado.", style="StatusSuccess.TLabel")
+                    self._show_summary_window(item[1])
+                elif kind == "summary_error":
+                    self._summarizing = False
+                    self.summarize_btn.config(state="normal")
+                    self.status_label.config(text="⚠ Error al resumir.", style="StatusError.TLabel")
+                    messagebox.showerror("Error al resumir", item[1])
         except queue.Empty:
             pass
 
-        if self._worker_running:
+        if self._worker_running or self._summarizing:
             self.root.after(100, self._poll_queue)
 
     def _save_txt(self):
@@ -504,6 +703,7 @@ class TranscriberApp:
 
     def _clear_text(self):
         self.text_area.delete("1.0", tk.END)
+        self._refresh_text_actions_state()
 
 
 def main():

@@ -2,3 +2,4 @@ faster-whisper>=1.0.3
 ctranslate2==4.4.0
 onnxruntime==1.18.1
 sv-ttk>=2.5.5
+anthropic>=0.69.0
